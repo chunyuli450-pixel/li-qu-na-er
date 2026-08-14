@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#ef7654" />
+    <meta name="application-name" content="李去哪儿" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="李去哪儿" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" href="./app-icon-192.png" type="image/png" />
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+    <meta name="description" content="李去哪儿——本地旅行路线规划工具" />
+    <title>李去哪儿｜旅行路线规划</title>
+    <link rel="stylesheet" href="./app/globals.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "react": "https://esm.sh/react@19.2.6",
+          "react-dom/client": "https://esm.sh/react-dom@19.2.6/client",
+          "react/jsx-runtime": "https://esm.sh/react@19.2.6/jsx-runtime"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./local-main.js"></script>
+  </body>
+</html>
