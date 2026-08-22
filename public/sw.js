@@ -1,4 +1,4 @@
-const CACHE_VERSION = "2026.08.14.2";
+const CACHE_VERSION = "2026.08.23.1";
 const CACHE_NAME = `li-qu-na-er-${CACHE_VERSION}`;
 const APP_SCOPE = self.registration.scope;
 const appUrl = (path) => new URL(path, APP_SCOPE).href;

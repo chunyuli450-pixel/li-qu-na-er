@@ -1,11 +1,12 @@
 "use client";
 
-import { ChangeEvent, DragEvent, KeyboardEvent, MouseEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, KeyboardEvent, MouseEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import PwaManager from "./PwaManager";
 
 type TravelMode = "transit" | "driving" | "taxi" | "walking" | "riding";
 type PlaceType = "hotel" | "sight" | "food" | "shopping" | "railway" | "airport" | "other";
 type OptimizeBy = "time" | "distance";
+type DrawerState = "collapsed" | "half" | "expanded";
 
 type PlaceLink = {
   id: string;
@@ -96,6 +97,8 @@ declare global {
 const STORAGE_KEY = "li-qu-na-er-trips-v1";
 const ACTIVE_KEY = "li-qu-na-er-active-trip-v1";
 const ACTIVE_DAY_KEY = "li-qu-na-er-active-day-v1";
+const PANEL_COLLAPSED_KEY = "li-qu-na-er-panel-collapsed-v1";
+const DRAWER_STATE_KEY = "li-qu-na-er-mobile-drawer-v1";
 
 const modeLabels: Record<TravelMode, string> = {
   transit: "公共交通",
@@ -111,6 +114,14 @@ const modeIcons: Record<TravelMode, string> = {
   taxi: "🚕",
   walking: "🚶",
   riding: "🚲",
+};
+
+const routeLineStyles: Record<TravelMode, { color: string; dashed: boolean }> = {
+  transit: { color: "#E3AD24", dashed: false },
+  driving: { color: "#EE7A32", dashed: false },
+  taxi: { color: "#3478F6", dashed: false },
+  walking: { color: "#35A66F", dashed: true },
+  riding: { color: "#159B87", dashed: false },
 };
 
 const typeLabels: Record<PlaceType, string> = {
@@ -570,14 +581,18 @@ export default function Home() {
   const [activeResult, setActiveResult] = useState(-1);
   const [toast, setToast] = useState("");
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
+  const [panelCollapsed, setPanelCollapsed] = useState(false);
+  const [drawerState, setDrawerState] = useState<DrawerState>("half");
   const [mapStatus, setMapStatus] = useState<"demo" | "loading" | "ready" | "error">("demo");
   const [routeMetrics, setRouteMetrics] = useState<RouteMetric[]>([]);
+  const [routeNotice, setRouteNotice] = useState("");
   const mapRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<any>(null);
   const routeServicesRef = useRef<any[]>([]);
   const fileRef = useRef<HTMLInputElement>(null);
   const searchBoxRef = useRef<HTMLDivElement>(null);
   const searchSequenceRef = useRef(0);
+  const pointerSortRef = useRef<{ pointerId: number; index: number } | null>(null);
 
   const trip = trips.find((item) => item.id === activeId) || trips[0];
   const day = trip?.days[selectedDay];
@@ -593,6 +608,9 @@ export default function Home() {
       setTrips(initial);
       setActiveId(initialTrip.id);
       setSelectedDay(Math.max(0, Math.min(Number.isFinite(storedDay) ? storedDay : 0, initialTrip.days.length - 1)));
+      setPanelCollapsed(localStorage.getItem(PANEL_COLLAPSED_KEY) === "true");
+      const storedDrawer = localStorage.getItem(DRAWER_STATE_KEY);
+      if (storedDrawer === "collapsed" || storedDrawer === "half" || storedDrawer === "expanded") setDrawerState(storedDrawer);
     } catch {
       const initial = [createDemoTrip()];
       setTrips(initial);
@@ -606,7 +624,21 @@ export default function Home() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(trips));
     localStorage.setItem(ACTIVE_KEY, activeId);
     localStorage.setItem(ACTIVE_DAY_KEY, String(selectedDay));
-  }, [trips, activeId, selectedDay, hydrated]);
+    localStorage.setItem(PANEL_COLLAPSED_KEY, String(panelCollapsed));
+    localStorage.setItem(DRAWER_STATE_KEY, drawerState);
+  }, [trips, activeId, selectedDay, panelCollapsed, drawerState, hydrated]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const map = mapInstanceRef.current;
+      if (!map) return;
+      map.resize?.();
+      const mobile = window.matchMedia("(max-width: 900px)").matches;
+      const bottomPadding = mobile && drawerState === "half" ? Math.round(window.innerHeight * 0.42) + 18 : 82;
+      map.setFitView?.(undefined, false, [70, 60, bottomPadding, 60], 15);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [panelCollapsed, drawerState]);
 
   const updateTrip = (updater: (current: Trip) => Trip) => {
     setTrips((items) => items.map((item) => item.id === activeId ? { ...updater(item), updatedAt: new Date().toISOString() } : item));
@@ -663,8 +695,10 @@ export default function Home() {
     const map = mapInstanceRef.current;
     if (!AMap || !map || !day || mapStatus !== "ready") {
       setRouteMetrics([]);
+      setRouteNotice("");
       return;
     }
+    setRouteNotice("正在获取高德实时路线…");
     routeServicesRef.current.forEach((service) => service.clear?.());
     routeServicesRef.current = [];
     map.clearMap();
@@ -682,6 +716,8 @@ export default function Home() {
     if (!day.startHotel || !day.stops.length) return () => { cancelled = true; };
     const routePoints = [day.startHotel, ...day.stops, ...(day.returnToHotel && day.endHotel ? [day.endHotel] : [])];
     const metrics: RouteMetric[] = [];
+    let routeFailureCount = 0;
+    let domainBlocked = false;
     const drawPolyline = (path: any[], strokeColor: string, dashed = false) => {
       if (!Array.isArray(path) || path.length < 2) return false;
       map.add(new AMap.Polyline({
@@ -709,12 +745,12 @@ export default function Home() {
         const transit = segment.transit || {};
         const path = transitSegmentPath(segment);
         if (mode === "WALK") {
-          if (drawPolyline(path, "#2F9E70", true)) drawnSegments += 1;
+          if (drawPolyline(path, routeLineStyles.walking.color, routeLineStyles.walking.dashed)) drawnSegments += 1;
           return;
         }
         const isSubway = mode === "SUBWAY" || mode === "METRO_RAIL";
         const isRide = mode === "BUS" || isSubway;
-        if (drawPolyline(path, isSubway ? subwaySegmentColor(segment) : "#2F80ED")) {
+        if (drawPolyline(path, isSubway ? subwaySegmentColor(segment) : routeLineStyles.transit.color)) {
           drawnSegments += 1;
           if (isRide) drawnRideSegments += 1;
         }
@@ -734,11 +770,14 @@ export default function Home() {
         }
         rideSegmentCount += 1;
       });
-      if (!drawnSegments || !drawnRideSegments) drawPolyline(flattenRoutePath(route), "#2F80ED");
+      if (!drawnSegments || !drawnRideSegments) drawPolyline(flattenRoutePath(route), routeLineStyles.transit.color);
     };
     const finishRoutes = () => {
       if (cancelled) return;
       setRouteMetrics([...metrics]);
+      if (domainBlocked) setRouteNotice("路线未授权：请检查高德 Key 的域名白名单");
+      else if (routeFailureCount) setRouteNotice("部分路线暂不可用，当前显示本地预估");
+      else setRouteNotice("已采用高德实时路线");
       map.setFitView(undefined, false, [70, 70, 70, 70], 15);
     };
     const queryLeg = (index: number, departureMinutes: number) => {
@@ -760,6 +799,11 @@ export default function Home() {
       const handleResult = (status: string, result: any) => {
         if (cancelled) return;
         const route = result?.routes?.[0] || result?.plans?.[0];
+        if (status !== "complete" || !route) {
+          routeFailureCount += 1;
+          const errorText = [result?.info, result?.message, result?.status, typeof result === "string" ? result : ""].filter(Boolean).join(" ");
+          if (/INVALID_USER_DOMAIN/i.test(errorText)) domainBlocked = true;
+        }
         const fallback = fallbackMetric(from.location, to.location, mode);
         const seconds = Number(route?.time || 0);
         const meters = Number(route?.distance || 0);
@@ -771,7 +815,7 @@ export default function Home() {
         const arrivalMinutes = departureMinutes + minutes;
         if (status === "complete" && route) {
           if (mode === "transit") drawTransitRoute(route);
-          else drawPolyline(flattenRoutePath(route), mode === "walking" || mode === "riding" ? "#2F9E70" : "#2F80ED");
+          else drawPolyline(flattenRoutePath(route), routeLineStyles[mode].color, routeLineStyles[mode].dashed);
         }
         metrics[index] = status === "complete" && route
           ? { minutes, distanceKm: meters ? meters / 1000 : fallback.distanceKm, cost: costRange?.min ?? null, costMax: costRange?.max ?? null, live: true, transitSummary: mode === "transit" ? transitBrief(route) : "", departureMinutes, arrivalMinutes }
@@ -1008,6 +1052,43 @@ export default function Home() {
     });
   };
 
+  const startPointerSort = (event: ReactPointerEvent<HTMLButtonElement>, index: number) => {
+    if (event.pointerType === "mouse") return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    pointerSortRef.current = { pointerId: event.pointerId, index };
+    setDraggedIndex(index);
+  };
+
+  const updatePointerSort = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const current = pointerSortRef.current;
+    if (!current || current.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-stop-index]");
+    const targetIndex = Number(target?.dataset.stopIndex);
+    if (Number.isInteger(targetIndex) && targetIndex !== current.index) {
+      moveStop(current.index, targetIndex);
+      current.index = targetIndex;
+      setDraggedIndex(targetIndex);
+    }
+    const scrollArea = document.querySelector<HTMLElement>(".itinerary-content");
+    if (!scrollArea) return;
+    const bounds = scrollArea.getBoundingClientRect();
+    if (event.clientY < bounds.top + 70) scrollArea.scrollBy({ top: -18 });
+    else if (event.clientY > bounds.bottom - 70) scrollArea.scrollBy({ top: 18 });
+  };
+
+  const finishPointerSort = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (pointerSortRef.current?.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    pointerSortRef.current = null;
+    setDraggedIndex(null);
+    try { event.currentTarget.releasePointerCapture?.(event.pointerId); } catch { /* Pointer capture may already be released. */ }
+  };
+
+  const cycleDrawerState = () => setDrawerState((current) => current === "collapsed" ? "half" : current === "half" ? "expanded" : "collapsed");
+
   const changeLeg = (index: number, mode: TravelMode) => updateDay((current) => ({ ...current, legs: current.legs.map((item, i) => i === index ? mode : item) }));
 
   const removeStop = (id: string) => {
@@ -1061,14 +1142,22 @@ export default function Home() {
         <button className="ghost-button" onClick={() => setShowTripEditor(true)}>编辑旅程信息</button>
       </section>
 
-      <section className="planner-layout">
+      <section className={`planner-layout ${panelCollapsed ? "panel-collapsed" : ""} drawer-${drawerState}`}>
         <aside className="itinerary-panel">
+          <div className="drawer-toolbar">
+            <button className="drawer-grip" onClick={cycleDrawerState} aria-label="切换行程抽屉高度"><span /></button>
+            <div className="drawer-heading"><b>今日行程</b><small>{day.stops.length} 个地点 · {dateLabel(day.date)}</small></div>
+            <button className="drawer-add-trip" onClick={newTrip}>＋ 新建旅程</button>
+            <button className="mobile-drawer-toggle" onClick={cycleDrawerState} aria-expanded={drawerState !== "collapsed"}>{drawerState === "collapsed" ? "展开" : drawerState === "half" ? "全屏" : "收起"}</button>
+            <button className="desktop-panel-toggle" onClick={() => setPanelCollapsed((current) => !current)} aria-expanded={!panelCollapsed} aria-label={panelCollapsed ? "展开行程面板" : "收起行程面板"}>{panelCollapsed ? "›" : "‹"}</button>
+          </div>
+          <div className="itinerary-content">
           <div className="day-tabs" role="tablist" aria-label="选择日期">
             {trip.days.map((item, index) => <button key={item.date} className={index === selectedDay ? "active" : ""} onClick={() => { setSelectedDay(index); setRouteMetrics([]); }}><span>DAY {index + 1}</span><b>{dateLabel(item.date)}</b><small>周{weekday(item.date)}</small></button>)}
           </div>
 
           <div className="route-planner-box">
-            <div className="route-planner-head"><div><span className="status-dot" /><b>智能路线规划</b><small>{mapStatus === "ready" ? "采用高德实时路线结果" : "当前采用本地预估"}</small></div><button onClick={() => {
+            <div className="route-planner-head"><div><span className={`status-dot ${routeNotice.startsWith("路线未授权") ? "warning" : ""}`} /><b>智能路线规划</b><small className={routeNotice.startsWith("路线未授权") ? "route-notice-warning" : ""}>{mapStatus === "ready" ? (routeNotice || "正在连接高德路线服务…") : "当前采用本地预估"}</small></div><button onClick={() => {
               if (!day.startHotel) return notify("请先添加并设置当天出发酒店");
               if (day.returnToHotel && !day.endHotel) return notify("请先设置当晚酒店，或关闭最终酒店路段");
               const result = optimizeDay(day);
@@ -1080,7 +1169,7 @@ export default function Home() {
               <div className="segmented"><button className={day.optimizeBy === "time" ? "active" : ""} onClick={() => updateDay((current) => ({ ...current, optimizeBy: "time" }))}>时间优先</button><button className={day.optimizeBy === "distance" ? "active" : ""} onClick={() => updateDay((current) => ({ ...current, optimizeBy: "distance" }))}>路程优先</button></div>
               <label className="return-toggle"><input type="checkbox" checked={day.returnToHotel} onChange={(event) => updateDay((current) => ({ ...current, returnToHotel: event.target.checked }))} /><span />{endHotelAction}</label>
             </div>
-            <div className="planning-row mode-picker"><span>自动规划可用</span><div>{allModes.map((mode) => <button key={mode} className={day.allowedModes.includes(mode) ? "active" : ""} onClick={() => toggleAllowedMode(mode)}>{modeIcons[mode]} {modeLabels[mode]}</button>)}</div></div>
+            <div className="planning-row mode-picker"><span>自动规划可用</span><div>{allModes.map((mode) => <button key={mode} className={`mode-option mode-${mode} ${day.allowedModes.includes(mode) ? "active" : ""}`} onClick={() => toggleAllowedMode(mode)}>{modeIcons[mode]} {modeLabels[mode]}</button>)}</div></div>
           </div>
 
           <div className="timeline">
@@ -1095,9 +1184,9 @@ export default function Home() {
               const metric = effectiveMetrics[index];
               const legMode = day.legs[index] || "transit";
               return <div key={stop.id}>
-                <div className="leg-row"><span>{modeIcons[legMode]}</span><select value={legMode} onChange={(event) => changeLeg(index, event.target.value as TravelMode)} aria-label={`前往${stop.name}的交通方式`}>{allModes.map((mode) => <option key={mode} value={mode}>{modeLabels[mode]}</option>)}</select><i /><small>{routeBrief(metric, legMode)}</small>{legMode === "transit" && <em className="leg-period">{routePeriod(metric)}</em>}{(legMode === "transit" || legMode === "taxi") && <em className="leg-cost">{routeCost(metric, legMode)}</em>}</div>
-                <article className={`stop-card ${timing?.late ? "conflict" : ""}`} draggable onClick={(event) => editCardClick(event, stop)} onDragStart={() => setDraggedIndex(index)} onDragOver={(event: DragEvent) => event.preventDefault()} onDrop={() => { if (draggedIndex !== null) moveStop(draggedIndex, index); setDraggedIndex(null); }}>
-                  <button className="drag-handle" aria-label="拖动排序">⠿</button><span className="stop-number">{index + 1}</span>
+                <div className={`leg-row mode-${legMode}`}><span>{modeIcons[legMode]}</span><select value={legMode} onChange={(event) => changeLeg(index, event.target.value as TravelMode)} aria-label={`前往${stop.name}的交通方式`}>{allModes.map((mode) => <option key={mode} value={mode}>{modeLabels[mode]}</option>)}</select><i /><small>{routeBrief(metric, legMode)}</small>{legMode === "transit" && <em className="leg-period">{routePeriod(metric)}</em>}{(legMode === "transit" || legMode === "taxi") && <em className="leg-cost">{routeCost(metric, legMode)}</em>}</div>
+                <article data-stop-index={index} className={`stop-card ${timing?.late ? "conflict" : ""} ${draggedIndex === index ? "sorting" : ""}`} draggable onClick={(event) => editCardClick(event, stop)} onDragStart={(event: DragEvent) => { event.dataTransfer.effectAllowed = "move"; setDraggedIndex(index); }} onDragEnd={() => setDraggedIndex(null)} onDragOver={(event: DragEvent) => event.preventDefault()} onDrop={() => { if (draggedIndex !== null) moveStop(draggedIndex, index); setDraggedIndex(null); }}>
+                  <button className="drag-handle" aria-label={`拖动${stop.name}调整顺序`} onPointerDown={(event) => startPointerSort(event, index)} onPointerMove={updatePointerSort} onPointerUp={finishPointerSort} onPointerCancel={finishPointerSort}>⠿</button><span className="stop-number">{index + 1}</span>
                   <div className="stop-main">
                     <div className="stop-title"><span>{typeIcons[stop.type]}</span><b>{stop.name}</b></div>
                     <p>{stop.address}</p><div className="card-detail-line">{cardDetail(stop) || "点击卡片完善地点信息与备注"}</div>
@@ -1114,8 +1203,9 @@ export default function Home() {
               </div>;
             })}
 
-            {day.returnToHotel && day.endHotel && day.stops.length > 0 && <div className="leg-row return-leg"><span>{modeIcons[day.legs[day.stops.length] || "transit"]}</span><select value={day.legs[day.stops.length] || "transit"} onChange={(event) => changeLeg(day.stops.length, event.target.value as TravelMode)} aria-label={`${endHotelAction}的交通方式`}>{allModes.map((mode) => <option key={mode} value={mode}>{modeLabels[mode]}</option>)}</select><i /><small>{routeBrief(effectiveMetrics[day.stops.length], day.legs[day.stops.length] || "transit")}</small>{(day.legs[day.stops.length] || "transit") === "transit" && <em className="leg-period">{routePeriod(effectiveMetrics[day.stops.length])}</em>}{(["transit", "taxi"] as TravelMode[]).includes(day.legs[day.stops.length] || "transit") && <em className="leg-cost">{routeCost(effectiveMetrics[day.stops.length], day.legs[day.stops.length] || "transit")}</em>}</div>}
+            {day.returnToHotel && day.endHotel && day.stops.length > 0 && <div className={`leg-row return-leg mode-${day.legs[day.stops.length] || "transit"}`}><span>{modeIcons[day.legs[day.stops.length] || "transit"]}</span><select value={day.legs[day.stops.length] || "transit"} onChange={(event) => changeLeg(day.stops.length, event.target.value as TravelMode)} aria-label={`${endHotelAction}的交通方式`}>{allModes.map((mode) => <option key={mode} value={mode}>{modeLabels[mode]}</option>)}</select><i /><small>{routeBrief(effectiveMetrics[day.stops.length], day.legs[day.stops.length] || "transit")}</small>{(day.legs[day.stops.length] || "transit") === "transit" && <em className="leg-period">{routePeriod(effectiveMetrics[day.stops.length])}</em>}{(["transit", "taxi"] as TravelMode[]).includes(day.legs[day.stops.length] || "transit") && <em className="leg-cost">{routeCost(effectiveMetrics[day.stops.length], day.legs[day.stops.length] || "transit")}</em>}</div>}
             <div className={`hotel-card finish ${day.returnToHotel && day.endHotel ? "clickable" : ""}`} onClick={() => day.returnToHotel && day.endHotel && openHotelEditor(day.endHotel)}><span className="timeline-icon">{day.returnToHotel ? "🌙" : "🏁"}</span><div><small>{day.returnToHotel ? (returnTime ? formatClock(returnTime) : "—") : (schedule.at(-1) ? formatClock(schedule.at(-1)!.departure) : "—")} · {day.returnToHotel ? "当晚酒店" : "行程结束"}</small><b>{day.returnToHotel ? day.endHotel?.name || "还没有设置当晚酒店" : day.stops.at(-1)?.name || "今天的终点"}</b><p>{day.returnToHotel ? (differentHotels ? "今天换一家住处，路线已计入前往酒店的时间" : "结束充实的一天，好好休息") : "本次规划不计算前往当晚酒店的路线"}</p></div>{day.returnToHotel && day.endHotel && <PlaceLinkButtons place={day.endHotel} city={trip.city} />}</div>
+          </div>
           </div>
         </aside>
 
@@ -1131,6 +1221,7 @@ export default function Home() {
           </div>
 
           <div className="map-summary"><div><small>今日地点</small><b>{day.stops.length}</b></div><i /><div><small>交通耗时</small><b>{Math.floor(totalTravel / 60)}h {totalTravel % 60}m</b></div><i /><div><small>总路程</small><b>{totalDistance.toFixed(1)} km</b></div><i /><div><small>公共交通/打车</small><b>{costSummary}</b></div></div>
+          <div className="route-legend" aria-label="地图路线颜色说明"><span><i className="route-swatch taxi" />打车</span><span><i className="route-swatch driving" />自驾</span><span><i className="route-swatch walking" />步行</span><span><i className="route-swatch riding" />骑行</span><span><i className="route-swatch transit" />公交</span><span><i className="route-swatch subway" />地铁线路色</span></div>
         </section>
       </section>
 
